@@ -104,8 +104,8 @@ def get_path_test_chapters_txt(get_base_path: Path) -> Path:
 
 
 # Source chapters XML used to build the real chaptered fixture file below. Deliberately includes
-# fields that pymkv.chapters.Chapters does not model (ChapterPhysicalEquiv, ChapLanguageIETF) so
-# tests can assert those are preserved on remux instead of being silently dropped.
+# fields that are easy to lose on a round trip (ChapterPhysicalEquiv, ChapLanguageIETF) so tests
+# can assert they are preserved on remux.
 _CHAPTERS_SOURCE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <Chapters>
   <EditionEntry>
@@ -118,6 +118,14 @@ _CHAPTERS_SOURCE_XML = """<?xml version="1.0" encoding="UTF-8"?>
         <ChapterString>Intro</ChapterString>
         <ChapterLanguage>chi</ChapterLanguage>
         <ChapLanguageIETF>zh-Hans</ChapLanguageIETF>
+      </ChapterDisplay>
+    </ChapterAtom>
+    <ChapterAtom>
+      <ChapterUID>2002</ChapterUID>
+      <ChapterTimeStart>00:00:01.000000000</ChapterTimeStart>
+      <ChapterDisplay>
+        <ChapterString>Outro</ChapterString>
+        <ChapterLanguage>eng</ChapterLanguage>
       </ChapterDisplay>
     </ChapterAtom>
   </EditionEntry>
@@ -199,6 +207,8 @@ def mock_mkv(request: Any) -> MagicMock:  # noqa: ANN401
     mkv.tracks = []
     mkv.attachments = []
     mkv._chapters_file = None  # noqa: SLF001
+    mkv._temp_chapters_file = None  # noqa: SLF001
+    mkv._chapters_to_drop = frozenset()  # noqa: SLF001
     mkv._chapter_language = None  # noqa: SLF001
     mkv._link_to_previous_file = None  # noqa: SLF001
     mkv._link_to_next_file = None  # noqa: SLF001

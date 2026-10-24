@@ -1,3 +1,4 @@
+import shutil
 import subprocess as sp
 from pathlib import Path
 from unittest.mock import Mock
@@ -6,7 +7,7 @@ import msgspec
 import pytest
 
 from pymkv import MKVFile
-from pymkv.chapters import ChapterAtom, ChapterDisplay, Chapters
+from pymkv.chapters import ChapterAtom, ChapterDisplay, Chapters, EditionEntry, parse_chapters_xml
 from pymkv.Verifications import get_file_info
 from tests.conftest import requires_mkvtoolnix
 
@@ -233,7 +234,7 @@ def test_chapters_obj_defaults_to_none() -> None:
 
 
 def test_read_chapters_parses_mkvextract_output(monkeypatch: pytest.MonkeyPatch, dummy_mkv: Path) -> None:
-    """Unit test for the plumbing in `_read_chapters` (command shape, stdout decoding)."""
+    """Unit test for the plumbing in `_read_chapters` (command shape, stdout parsing)."""
     mkv = MKVFile()
 
     xml_output = b"""<?xml version="1.0" encoding="UTF-8"?>
@@ -339,36 +340,266 @@ def test_init_populates_chapters_obj_from_existing_file(get_path_test_file_with_
     assert mkv.chapters_obj.editions[0].atoms[0].displays[0].string == "Intro"
 
 
+def _extract_chapters(path: Path) -> Chapters:
+    """Chapters of `path` as reported by the real mkvextract."""
+    mkvextract = shutil.which("mkvextract")
+    assert mkvextract is not None
+    result = sp.run([mkvextract, "chapters", str(path)], check=True, capture_output=True)  # noqa: S603
+    return parse_chapters_xml(result.stdout)
+
+
+def _chapter_count(path: Path) -> int:
+    info = get_file_info(path, "mkvmerge")
+    return sum(c.num_entries for c in info.chapters)
+
+
 @requires_mkvtoolnix
-def test_command_does_not_rewrite_chapters_read_from_source(get_path_test_file_with_chapters: Path) -> None:
-    """Chapters populated from an existing file must not be round-tripped through `Chapters`."""
+def test_command_passes_through_untouched_chapters(get_path_test_file_with_chapters: Path) -> None:
+    """Chapters read from the source must be left to mkvmerge."""
     mkv = MKVFile(str(get_path_test_file_with_chapters))
-    assert mkv.chapters_obj is not None  # sanity check: the fixture does have chapters
+    assert mkv.chapters_obj is not None
 
     command = mkv.command("output.mkv", subprocess=True)
 
     assert "--chapters" not in command
-    assert mkv._chapters_file is None  # noqa: SLF001
+    assert "--no-chapters" not in command
+    assert mkv._temp_chapters_file is None  # noqa: SLF001
 
 
 @requires_mkvtoolnix
-def test_command_rewrites_chapters_after_explicit_edit(get_path_test_file_with_chapters: Path) -> None:
-    """Once the caller explicitly edits chapters that came from the source file, they should be
-    written out and passed to mkvmerge via `--chapters`, since they no longer match the source.
-    """
+def test_mux_untouched_chapters_keeps_all_fields(get_path_test_file_with_chapters: Path, tmp_path: Path) -> None:
+    """Remuxing without edits keeps fields such as ChapterPhysicalEquiv and ChapLanguageIETF."""
+    output = tmp_path / "out.mkv"
+    MKVFile(str(get_path_test_file_with_chapters)).mux(output, silent=True)
+
+    atom = _extract_chapters(output).editions[0].atoms[0]
+    assert atom.physical_equiv == 10  # noqa: PLR2004
+    assert atom.displays[0].language_ietf == ["zh-Hans"]
+
+
+@requires_mkvtoolnix
+def test_in_place_edit_is_written(get_path_test_file_with_chapters: Path, tmp_path: Path) -> None:
     mkv = MKVFile(str(get_path_test_file_with_chapters))
     assert mkv.chapters_obj is not None
+    mkv.chapters_obj.editions[0].atoms[0].displays[0].string = "RENAMED"
 
-    mkv.add_chapter(ChapterAtom(time_start="00:10:00.000", displays=[ChapterDisplay(string="New Chapter")]))
+    command = mkv.command("output.mkv", subprocess=True)
+    assert "--chapters" in command
+    assert command.index("--no-chapters") < command.index(str(get_path_test_file_with_chapters))
+
+    output = tmp_path / "out.mkv"
+    mkv.mux(output, silent=True)
+
+    atoms = _extract_chapters(output).editions[0].atoms
+    assert [a.displays[0].string for a in atoms] == ["RENAMED", "Outro"]
+
+
+@requires_mkvtoolnix
+def test_edit_keeps_unmodified_fields(get_path_test_file_with_chapters: Path, tmp_path: Path) -> None:
+    """Fields untouched by the edit survive the write path."""
+    mkv = MKVFile(str(get_path_test_file_with_chapters))
+    mkv.add_chapter(ChapterAtom(time_start="00:00:02.000", displays=[ChapterDisplay(string="New Chapter")]))
+
+    output = tmp_path / "out.mkv"
+    mkv.mux(output, silent=True)
+
+    atoms = _extract_chapters(output).editions[0].atoms
+    assert len(atoms) == 3  # noqa: PLR2004
+    assert atoms[0].physical_equiv == 10  # noqa: PLR2004
+    assert atoms[0].displays[0].language_ietf == ["zh-Hans"]
+    assert atoms[0].displays[0].language == "chi"
+
+
+@requires_mkvtoolnix
+def test_deleted_chapter_is_removed_from_output(get_path_test_file_with_chapters: Path, tmp_path: Path) -> None:
+    mkv = MKVFile(str(get_path_test_file_with_chapters))
+    chapters = mkv.chapters_obj
+    assert chapters is not None
+    del chapters.editions[0].atoms[1]
+    mkv.chapters_obj = chapters
+
+    output = tmp_path / "out.mkv"
+    mkv.mux(output, silent=True)
+
+    atoms = _extract_chapters(output).editions[0].atoms
+    assert [a.displays[0].string for a in atoms] == ["Intro"]
+
+
+@requires_mkvtoolnix
+def test_deleted_chapter_in_place_without_reassign(get_path_test_file_with_chapters: Path, tmp_path: Path) -> None:
+    mkv = MKVFile(str(get_path_test_file_with_chapters))
+    assert mkv.chapters_obj is not None
+    mkv.chapters_obj.editions[0].atoms.pop()
+
+    output = tmp_path / "out.mkv"
+    mkv.mux(output, silent=True)
+
+    assert len(_extract_chapters(output).editions[0].atoms) == 1
+
+
+@requires_mkvtoolnix
+@pytest.mark.parametrize("remove", ["none", "empty_chapters", "empty_edition"])
+def test_removing_all_chapters(get_path_test_file_with_chapters: Path, tmp_path: Path, remove: str) -> None:
+    mkv = MKVFile(str(get_path_test_file_with_chapters))
+    assert mkv.chapters_obj is not None
+    if remove == "none":
+        mkv.chapters_obj = None
+    elif remove == "empty_chapters":
+        mkv.chapters_obj = Chapters()
+    else:
+        mkv.chapters_obj.editions[0].atoms.clear()
+
+    command = mkv.command("output.mkv", subprocess=True)
+    assert "--no-chapters" in command
+    assert "--chapters" not in command
+
+    output = tmp_path / "out.mkv"
+    mkv.mux(output, silent=True)
+    assert _chapter_count(output) == 0
+
+
+@requires_mkvtoolnix
+def test_reverting_edit_returns_to_pass_through(get_path_test_file_with_chapters: Path) -> None:
+    mkv = MKVFile(str(get_path_test_file_with_chapters))
+    assert mkv.chapters_obj is not None
+    display = mkv.chapters_obj.editions[0].atoms[0].displays[0]
+
+    display.string = "Changed"
+    assert "--chapters" in mkv.command("output.mkv", subprocess=True)
+
+    display.string = "Intro"
+    command = mkv.command("output.mkv", subprocess=True)
+    assert "--chapters" not in command
+    assert "--no-chapters" not in command
+
+
+@requires_mkvtoolnix
+def test_second_command_reflects_later_edits(get_path_test_file_with_chapters: Path) -> None:
+    mkv = MKVFile(str(get_path_test_file_with_chapters))
+    assert mkv.chapters_obj is not None
+    mkv.chapters_obj.editions[0].atoms[0].displays[0].string = "First"
+    mkv.command("output.mkv")
+    first_temp = Path(mkv._temp_chapters_file or "")  # noqa: SLF001
+    assert "First" in first_temp.read_text(encoding="utf-8")
+
+    mkv.chapters_obj.editions[0].atoms[0].displays[0].string = "Second"
+    mkv.command("output.mkv")
+
+    assert not first_temp.exists()
+    second_temp = Path(mkv._temp_chapters_file or "")  # noqa: SLF001
+    assert "Second" in second_temp.read_text(encoding="utf-8")
+    mkv.cleanup()
+
+
+@requires_mkvtoolnix
+def test_chapters_file_takes_precedence_over_chapters_obj(
+    get_path_test_file_with_chapters: Path,
+    get_path_test_chapters_xml: Path,
+) -> None:
+    mkv = MKVFile(str(get_path_test_file_with_chapters))
+    assert mkv.chapters_obj is not None
+    mkv.chapters_obj.editions[0].atoms.clear()
+    mkv.chapters(str(get_path_test_chapters_xml))
 
     command = mkv.command("output.mkv", subprocess=True)
 
-    assert "--chapters" in command
-    assert mkv._chapters_file is not None  # noqa: SLF001
+    assert command.count("--chapters") == 1
+    assert str(get_path_test_chapters_xml) in command
+    assert "--no-chapters" not in command
+    assert mkv._temp_chapters_file is None  # noqa: SLF001
 
 
-def test_command_rewrites_chapters_reassigned_by_caller() -> None:
-    """Reassigning `chapters_obj` directly is also treated as a caller edit."""
+@requires_mkvtoolnix
+def test_add_file_path_imports_chapters(get_path_test_file_with_chapters: Path) -> None:
+    mkv = MKVFile()
+    mkv.add_file(str(get_path_test_file_with_chapters))
+
+    assert mkv.chapters_obj is not None
+    assert mkv.chapters_obj.editions[0].atoms[0].displays[0].string == "Intro"
+    assert "--chapters" not in mkv.command("output.mkv", subprocess=True)
+
+
+@requires_mkvtoolnix
+def test_add_file_mkvfile_imports_chapters(get_path_test_file_with_chapters: Path) -> None:
+    mkv = MKVFile()
+    mkv.add_file(MKVFile(str(get_path_test_file_with_chapters)))
+
+    assert mkv.chapters_obj is not None
+    assert len(mkv.chapters_obj.editions[0].atoms) == 2  # noqa: PLR2004
+
+
+@requires_mkvtoolnix
+def test_add_file_chapters_are_independent_copies(get_path_test_file_with_chapters: Path) -> None:
+    other = MKVFile(str(get_path_test_file_with_chapters))
+    mkv = MKVFile()
+    mkv.add_file(other)
+    assert mkv.chapters_obj is not None
+    mkv.chapters_obj.editions[0].atoms.clear()
+
+    assert other.chapters_obj is not None
+    assert len(other.chapters_obj.editions[0].atoms) == 2  # noqa: PLR2004
+
+
+@requires_mkvtoolnix
+def test_add_file_edit_drops_chapters_of_added_file(get_path_test_file_with_chapters: Path, tmp_path: Path) -> None:
+    mkv = MKVFile()
+    mkv.add_file(str(get_path_test_file_with_chapters))
+    assert mkv.chapters_obj is not None
+    mkv.chapters_obj.editions[0].atoms[0].displays[0].string = "RENAMED"
+
+    output = tmp_path / "out.mkv"
+    mkv.mux(output, silent=True)
+
+    atoms = _extract_chapters(output).editions[0].atoms
+    assert [a.displays[0].string for a in atoms] == ["RENAMED", "Outro"]
+
+
+@requires_mkvtoolnix
+def test_add_file_keeps_chapters_of_first_file(
+    get_path_test_file_with_chapters: Path,
+    get_path_test_file_two: Path,
+) -> None:
+    mkv = MKVFile(str(get_path_test_file_with_chapters))
+    mkv.add_file(str(get_path_test_file_two))
+
+    assert mkv.chapters_obj is not None
+    assert len(mkv.chapters_obj.editions[0].atoms) == 2  # noqa: PLR2004
+
+
+@requires_mkvtoolnix
+def test_add_file_does_not_replace_caller_chapters(
+    get_path_test_file_with_chapters: Path,
+    get_path_test_file_two: Path,
+) -> None:
+    mkv = MKVFile(str(get_path_test_file_two))
+    mkv.add_chapter(ChapterAtom(time_start="00:00:00.000", displays=[ChapterDisplay(string="Mine")]))
+    mkv.add_file(str(get_path_test_file_with_chapters))
+
+    assert mkv.chapters_obj is not None
+    assert [a.displays[0].string for a in mkv.chapters_obj.editions[0].atoms] == ["Mine"]
+
+
+@requires_mkvtoolnix
+def test_add_file_without_chapters_leaves_chapters_obj_none(get_path_test_file_two: Path) -> None:
+    mkv = MKVFile()
+    mkv.add_file(str(get_path_test_file_two))
+    assert mkv.chapters_obj is None
+
+
+@requires_mkvtoolnix
+def test_command_adds_no_chapters_flag_only_for_edited_sources(get_path_test_file_with_chapters: Path) -> None:
+    mkv = MKVFile(str(get_path_test_file_with_chapters))
+    assert "--no-chapters" not in mkv.command("output.mkv", subprocess=True)
+
+    mkv.add_chapter(ChapterAtom(time_start="00:00:02.000", displays=[ChapterDisplay(string="New")]))
+    command = mkv.command("output.mkv", subprocess=True)
+
+    assert command.count("--no-chapters") == 1
+    assert command.count("--chapters") == 1
+
+
+def test_command_rewrites_chapters_assigned_by_caller() -> None:
+    """A chapters object that did not come from a source file is always written."""
     mkv = MKVFile()
     mkv.chapters_obj = Chapters()
     mkv.chapters_obj.add_simple_chapter("00:00:00.000", "Intro")
@@ -376,7 +607,26 @@ def test_command_rewrites_chapters_reassigned_by_caller() -> None:
     command = mkv.command("output.mkv", subprocess=True)
 
     assert "--chapters" in command
-    assert mkv._chapters_file is not None  # noqa: SLF001
+    assert "--no-chapters" not in command
+    assert mkv._temp_chapters_file is not None  # noqa: SLF001
+    mkv.cleanup()
+
+
+def test_command_skips_editions_without_atoms() -> None:
+    mkv = MKVFile()
+    mkv.chapters_obj = Chapters(editions=[EditionEntry(uid=1)])
+
+    command = mkv.command("output.mkv", subprocess=True)
+
+    assert "--chapters" not in command
+    assert mkv._temp_chapters_file is None  # noqa: SLF001
+
+
+def test_add_chapter_invalid_type_does_not_create_chapters() -> None:
+    mkv = MKVFile()
+    with pytest.raises(TypeError):
+        mkv.add_chapter("nope")  # type: ignore[arg-type]
+    assert mkv.chapters_obj is None
 
 
 def test_no_attachments() -> None:
